@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SIS 2 - one part of the project reimplemented as Lambda functions.
+  Each function has its own least-privilege role, a published version and an alias.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment label, used in tags and the alias description.
+  ReleaseTag:
+    Type: String
+    Default: v1
+    Description: >
+      Change this value (v1 -> v2 ...) on every release. It forces CloudFormation
+      to publish a new immutable version and move the alias to it.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Resources:
+  # ---------------------------------------------------------------- data
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # ---------------------------------------------------------------- logs
+  # Log groups are created here (not by Lambda), so the roles do not need
+  # logs:CreateLogGroup and the retention is controlled by the template.
+  CreateItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  GetItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------- roles
+  CreateItemRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: create-item-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOneTable
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ItemsTable.Arn
+              - Sid: WriteOwnLogsOnly
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${CreateItemLogGroup.Arn}:*"
+
+  GetItemRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: get-item-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadOneTable
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt ItemsTable.Arn
+              - Sid: WriteOwnLogsOnly
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${GetItemLogGroup.Arn}:*"
+
+  # ---------------------------------------------------------------- functions
+  CreateItemFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CreateItemLogGroup
+    Properties:
+      Runtime: python3.13
+      Handler: app.handler
+      Code: src/create_item          # replaced by `aws cloudformation package`
+      Role: !GetAtt CreateItemRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      LoggingConfig:
+        LogGroup: !Ref CreateItemLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  GetItemFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetItemLogGroup
+    Properties:
+      Runtime: python3.13
+      Handler: app.handler
+      Code: src/get_item            # replaced by `aws cloudformation package`
+      Role: !GetAtt GetItemRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      LoggingConfig:
+        LogGroup: !Ref GetItemLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------- versions
+  # A version is an immutable snapshot of code + configuration.
+  # Changing ReleaseTag changes the Description, which replaces the Version
+  # resource, so a new version is published. Old versions are kept (Retain)
+  # so the alias can be rolled back.
+  CreateItemVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref CreateItemFunction
+      Description: !Sub "release ${ReleaseTag}"
+
+  GetItemVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref GetItemFunction
+      Description: !Sub "release ${ReleaseTag}"
+
+  # ---------------------------------------------------------------- aliases
+  # The alias is the stable name that callers (API Gateway, Step Functions
+  # next week) should use. It points to one published version.
+  CreateItemAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref CreateItemFunction
+      FunctionVersion: !GetAtt CreateItemVersion.Version
+      Name: live
+      Description: !Sub "${Environment} - ${ReleaseTag}"
+
+  GetItemAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref GetItemFunction
+      FunctionVersion: !GetAtt GetItemVersion.Version
+      Name: live
+      Description: !Sub "${Environment} - ${ReleaseTag}"
+
+Outputs:
+  TableName:
+    Value: !Ref ItemsTable
+  CreateItemFunctionName:
+    Value: !Ref CreateItemFunction
+  CreateItemAliasArn:
+    Description: Use this ARN in API Gateway / Step Functions next week.
+    Value: !Ref CreateItemAlias
+  CreateItemVersion:
+    Value: !GetAtt CreateItemVersion.Version
+  CreateItemRoleArn:
+    Value: !GetAtt CreateItemRole.Arn
+  GetItemFunctionName:
+    Value: !Ref GetItemFunction
+  GetItemAliasArn:
+    Description: Use this ARN in API Gateway / Step Functions next week.
+    Value: !Ref GetItemAlias
+  GetItemVersion:
+    Value: !GetAtt GetItemVersion.Version
+  GetItemRoleArn:
+    Value: !GetAtt GetItemRole.Arn
