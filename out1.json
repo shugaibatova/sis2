@@ -1,0 +1,1 @@
+{"statusCode": 201, "headers": {"Content-Type": "application/json"}, "body": "{\"id\": \"1\", \"name\": \"book\", \"createdAt\": 1795353476}"}
